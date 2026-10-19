@@ -44,6 +44,7 @@ pub fn seconds_to_deplete(rate: i128, balance: i128) -> Option<u64> {
 #[cfg(test)]
 mod test {
     use super::{accrued, seconds_to_deplete};
+    use proptest::prelude::*;
 
     #[test]
     fn zero_rate_accrues_nothing() {
@@ -303,6 +304,53 @@ mod test {
         assert_eq!(seconds_to_deplete(10, 99), Some(10));
         // A balance below the rate finishes inside the first second.
         assert_eq!(seconds_to_deplete(1_000, 1), Some(1));
+    }
+
+    proptest! {
+        /// A positive balance at a positive rate always takes at least one
+        /// whole second (and never returns `None`) for values that fit in u64.
+        #[test]
+        fn positive_balance_never_depletes_in_zero_seconds(
+            rate in 1i128..1_000_000,
+            balance in 1i128..1_000_000_000_000,
+        ) {
+            let seconds = seconds_to_deplete(rate, balance)
+                .expect("bounded positive rate/balance fits in u64");
+            prop_assert!(seconds > 0, "rate={rate} balance={balance} -> {seconds}");
+        }
+
+        /// More balance can never deplete sooner at the same rate.
+        #[test]
+        fn monotonic_in_balance(
+            rate in 1i128..1_000_000,
+            low in 1i128..1_000_000_000,
+            extra in 0i128..1_000_000_000,
+        ) {
+            let high = low + extra;
+            let low_seconds = seconds_to_deplete(rate, low).unwrap();
+            let high_seconds = seconds_to_deplete(rate, high).unwrap();
+            prop_assert!(
+                low_seconds <= high_seconds,
+                "rate={rate} low={low} ({low_seconds}s) high={high} ({high_seconds}s)"
+            );
+        }
+
+        /// At the returned time `accrued` has paid out the whole balance,
+        /// and one second earlier it has not.
+        #[test]
+        fn accrued_matches_depletion_time(
+            rate in 1i128..1_000_000,
+            balance in 1i128..1_000_000_000_000,
+        ) {
+            let seconds = seconds_to_deplete(rate, balance).unwrap();
+            prop_assert_eq!(accrued(rate, seconds, balance), balance);
+            if seconds > 0 {
+                prop_assert!(
+                    accrued(rate, seconds - 1, balance) < balance,
+                    "rate={rate} balance={balance} depleted a second early"
+                );
+            }
+        }
     }
 
     #[test]
