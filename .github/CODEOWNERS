@@ -1,0 +1,38 @@
+# Changes to these paths need approval from a maintainer before they can be merged.
+
+# Editor, dev container and build config can run code on a contributor's machine or in CI.
+/.vscode/ @Ashborne267
+/.devcontainer/ @Ashborne267
+/.cargo/ @Ashborne267
+build.rs @Ashborne267
+
+# Repository automation, including this file.
+/.github/ @Ashborne267
+
+# package.json can define install-time scripts that run on npm install.
+package.json @Ashborne267
+
+# Fonts, binaries, archives and script runners can hide payloads.
+*.woff @Ashborne267
+*.woff2 @Ashborne267
+*.ttf @Ashborne267
+*.otf @Ashborne267
+*.eot @Ashborne267
+*.llf @Ashborne267
+*.exe @Ashborne267
+*.dll @Ashborne267
+*.so @Ashborne267
+*.dylib @Ashborne267
+*.bin @Ashborne267
+*.jar @Ashborne267
+*.zip @Ashborne267
+*.tar @Ashborne267
+*.gz @Ashborne267
+*.tgz @Ashborne267
+*.7z @Ashborne267
+*.rar @Ashborne267
+*.bat @Ashborne267
+*.cmd @Ashborne267
+*.ps1 @Ashborne267
+*.vbs @Ashborne267
+*.node @Ashborne267

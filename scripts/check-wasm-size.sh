@@ -15,19 +15,20 @@
 
 set -euo pipefail
 
-WASM_DIR="target/wasm32v1-none/release"
+# Determine script directory for self-locating
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+WASM_DIR="$SCRIPT_DIR/../target/wasm32v1-none/release"
 
-# Max size in bytes for each contract's compiled wasm.
-declare -A MAX_SIZES=(
-  [ngo_registry]=65536
-  [donation_vault]=98304
-)
+# Max sizes (parallel arrays for Bash 3 compatibility)
+MAX_NAMES=("ngo_registry" "donation_vault")
+MAX_VALUES=(65536 98304)
 
 status=0
 
-for name in "${!MAX_SIZES[@]}"; do
+for i in "${!MAX_NAMES[@]}"; do
+  name="${MAX_NAMES[i]}"
+  max="${MAX_VALUES[i]}"
   wasm_path="$WASM_DIR/${name}.wasm"
-  max="${MAX_SIZES[$name]}"
 
   if [[ ! -f "$wasm_path" ]]; then
     echo "error: $wasm_path not found — build the wasm32v1-none release target first" >&2

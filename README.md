@@ -14,20 +14,22 @@ which risks are knowingly accepted, see
 - `ngo-registry` — on-chain NGO application, verification, and registry
 - `donation-vault` — streaming donation vault (create / withdraw / cancel / modify streams)
 
-### Donation-vault admin transfer
+### Admin transfer (donation-vault and ngo-registry)
 
-Admin changes use a two-step handshake:
+Both contracts use the same two-step handshake. The registry has no pause
+switch, but its admin transfer is otherwise identical.
 
-1. The current admin calls `propose_admin(new_admin)`, which records the
-   pending administrator without changing the active admin.
-2. The proposed address calls `accept_admin()` to complete the transfer.
-3. Either side can abort the pending transfer by calling
-   `cancel_admin_proposal()` before acceptance; the active admin remains
-   unchanged.
+| Step | Entry point | Who may call it | Effect |
+| --- | --- | --- | --- |
+| 1 | `propose_admin(new_admin)` | The **current admin** (admin auth) | Records `new_admin` as pending. The active admin does not change. |
+| 2 | `accept_admin()` | The **pending admin only** (pending address auth) | Promotes the pending address to active admin and clears the proposal. |
+| 3 | `cancel_admin_proposal()` | The **current admin only** (admin auth) | Clears the pending proposal. The active admin does not change. |
 
-Only the current admin can propose or cancel a transfer, and only the pending
-administrator can accept it. The current admin continues to control
-admin-gated operations until acceptance succeeds.
+Only the current admin can propose or cancel. The pending address cannot
+cancel; it can only accept. Until `accept_admin()` succeeds, the current admin
+continues to control every admin-gated operation. In `donation-vault`, if the
+current admin renounces, both the active and pending slots are cleared; the
+registry has no renounce entry point.
 
 ## Release profile
 
@@ -54,40 +56,52 @@ let balance arithmetic wrap silently.
 
 ## Pausing
 
-`donation-vault` has an admin-gated `pause` / `unpause` pair — an
-emergency brake for when something is wrong. `pause` only flips a flag in
-the instance storage: no funds are moved, so every balance stays exactly
-where it was and there is nothing to unwind when the pause is lifted.
+`donation-vault` has an admin-gated `pause` / `unpause` pair — an emergency
+brake for when something is wrong. `pause` only flips the `Paused` flag in
+instance storage: no funds are moved by the call itself, so balances stay where
+they were and there is nothing to unwind when the pause is lifted.
 
-While the vault is paused, every entry point that moves tokens or changes
-touching storage or requiring any auth:
-Note that pausing does **not** stop time-based accrual. A stream's
-`pending_accrual` keeps growing while the vault is paused, so a stream
-paused for a week still owes a week of accrual once the pause is lifted.
-That accrual is claimable via `withdraw` as soon as the vault is
-unpaused.
+While paused, the vault is not fully frozen. The state-changing entry points
+that move funds or mutate stream state reject with `Error::ContractPaused`;
+donor cancellation and the exceptional admin rescue path stay available. Every
+other entry point, including all read-only views and the permissionless
+keep-alive, continues to work. The table below lists every public entry point.
 
+| Entry point | While paused |
+| --- | --- |
+| `create_stream` | **Rejected** — `ContractPaused` |
+| `withdraw` | **Rejected** — `ContractPaused` |
+| `withdraw_batch` | **Rejected** — `ContractPaused` |
+| `top_up` | **Rejected** — `ContractPaused` |
+| `modify_rate` | **Rejected** — `ContractPaused` |
+| `transfer_stream` | **Rejected** — `ContractPaused` |
+| `cancel_stream` | **Works** — donor auth; settles accrued payouts and refunds the unspent balance |
+| `rescue_stream` | **Only works while paused** — admin-only emergency path; returns `NotPaused` when the vault is active |
+| `pause` | **Rejected** when already paused — `AlreadyPaused` |
+| `unpause` | **Works** — admin auth; lifts the pause |
+| `renounce_admin` | **Works** — admin auth; no pause gate |
+| `extend_stream` | **Works** — permissionless TTL bump; no pause gate |
+| `init`, `__constructor` | **Works** during setup; neither has a pause gate (the vault cannot be paused before it is initialised) |
+| `propose_admin`, `accept_admin`, `cancel_admin_proposal` | **Work** — admin handshake is not paused |
+| `set_treasury`, `clear_treasury`, `set_fee_bps`, `set_token_fee_bps`, `clear_token_fee_bps` | **Work** — admin-gated configuration; no pause gate |
+| `set_min_deposit`, `set_cancel_grace_ledgers`, `set_max_streams_per_donor`, `set_registry`, `upgrade` | **Work** — admin-gated configuration; no pause gate |
+| `total_donated`, `admin`, `pending_admin`, `get_stream`, `streams_by_donor`, `stream_count`, `pending_accrual`, `depletion_time`, `pending_payout`, `paused`, `get_config`, `treasury`, `fee_bps`, `max_fee_bps`, `token_fee_bps`, `allowed_tokens`, `min_deposit`, `cancel_grace_ledgers`, `max_streams_per_donor`, `registry` | **Work** — read-only views are never paused |
 
-| Entry point     | While paused                                    |
-| --------------- | ----------------------------------------------- |
-| `create_stream` | Rejected                                        |
-| `withdraw`      | Rejected                                        |
-| `top_up`        | Rejected                                        |
-| `modify_rate`   | Rejected                                        |
-| `cancel_stream` | Still works — settles and refunds as usual      |
+Pausing does **not** stop time-based accrual. A stream's `pending_accrual`
+keeps growing while the vault is paused, so a stream paused for a week still
+owes a week of accrual once the pause is lifted. That accrual is claimable via
+`withdraw` as soon as the vault is unpaused.
 
+`withdraw` and `withdraw_batch` being rejected is the point of the brake: they
+are the paths that pay tokens straight out of the vault, so a pause triggered
+by a suspected vulnerability has to close them or an attacker could drain funds
+while the rest of the contract is frozen.
 
-`withdraw` being on that list is the point of the brake: it is the only
-path that pays tokens straight out of the vault, so a pause triggered by a
-suspected vulnerability has to close it or an attacker could simply drain
-funds while the rest of the contract is frozen.
-
-`cancel_stream` is deliberately left open. It is the one path that returns
-money to a donor, so keeping it available means a pause can never trap a
-donor's unspent deposit. The read-only views (`admin`, `pending_admin`,
-`get_stream`, `stream_count`, `pending_accrual`, `paused`, `treasury`,
-`fee_bps`) and `extend_stream` also keep working, since none of them can
-move funds, and `unpause` is of course still reachable.
+`cancel_stream` is deliberately left open. It is the one ordinary path that
+returns money to a donor, so keeping it available means a pause can never trap
+a donor's unspent deposit. `rescue_stream` is the opposite: it exists only for
+incident response, is admin-only, and deliberately refuses to run while the
+vault is active.
 
 ## Storage TTL and keeping entries alive
 
@@ -211,40 +225,54 @@ the numeric code below (e.g. a failed `try_withdraw` surfacing `Error(5)`).
 
 ### `donation-vault`
 
-| Code | Error                | Meaning                                                                 |
-| ---- | --------------------- | ------------------------------------------------------------------------ |
-| 1    | `AlreadyInitialized`  | `init` was already called; the vault already has an admin.               |
-| 2    | `NotInitialized`      | `init` has not been called yet, so there is no admin to act as.          |
-| 3    | `StreamNotFound`      | No stream exists for the given stream id.                                |
-| 4    | `InvalidAmount`       | `deposit` or `rate` passed to `create_stream`, the `amount` passed to `top_up`, or the `new_rate` passed to `modify_rate` was zero or negative. |
-| 5    | `NothingToWithdraw`   | The stream has accrued nothing since its last checkpoint.                |
-| 6    | `ContractPaused`      | The admin has paused the vault; see [Pausing](#pausing) for what still works. |
-| 7    | `FeeTooHigh`          | `set_fee_bps` was called with a value above the 10% (1,000 bps) cap.     |
-| 8    | `NoPendingAdmin`      | `accept_admin` was called without a prior (or already-completed) `propose_admin`. |
-| 9    | `ArithmeticOverflow`  | A stream's `balance`/`withdrawn` or the stream-id counter would overflow. |
-| 10   | `InvalidTreasury`     | `set_treasury` was called with the vault's own address.                  |
-| 10   | `SelfStream`          | `create_stream` was called with the same address as both `donor` and `ngo`, which would stream the donor's own deposit back to them. |
-| 11   | `StreamCancelled`     | `top_up` or `modify_rate` was called on a stream that `cancel_stream` has already closed out. |
-| 9    | `ArithmeticOverflow`  | A stream balance, withdrawn total, or stream ID would exceed its integer range. |
-| 10   | `DepositTooLow`       | `create_stream` was called with a deposit below the admin-configured minimum. |
-| 11   | `AlreadyPaused`       | `pause` was called when the vault was already paused. |
-| 12   | `AlreadyUnpaused`     | `unpause` was called when the vault was already active. |
-| 13   | `SelfStream`          | `create_stream` was called with the same address as both `donor` and `ngo`. |
-| 14   | `StreamCancelled`     | `top_up` or `modify_rate` was called on a stream that `cancel_stream` has already closed out. |
-| 15   | `InvalidAdmin`        | `propose_admin` was called with the current admin instead of a different address. |
+Codes 1–23 are the full `Error` enum. "Admin-gated" entry points first call
+`require_admin`, so they can also return `NotInitialized` (no admin) or
+`AdminRenounced`.
+
+| Code | Error | Meaning | Entry points |
+| --- | --- | --- | --- |
+| 1 | `AlreadyInitialized` | `init` already created an admin. | `init` |
+| 2 | `NotInitialized` | No admin is stored. | `admin`, `propose_admin`, `cancel_admin_proposal`, `pause`, `unpause`, `set_treasury`, `clear_treasury`, `set_fee_bps`, `set_token_fee_bps`, `clear_token_fee_bps`, `set_min_deposit`, `set_cancel_grace_ledgers`, `set_max_streams_per_donor`, `set_registry`, `renounce_admin`, `rescue_stream`, `upgrade` |
+| 3 | `StreamNotFound` | No stream exists for the id. | `get_stream`, `pending_accrual`, `depletion_time`, `pending_payout`, `extend_stream`, `withdraw`, `withdraw_batch`, `cancel_stream`, `rescue_stream`, `top_up`, `modify_rate`, `transfer_stream` |
+| 4 | `InvalidAmount` | A deposit, rate, top-up, rate change, or minimum deposit was zero/negative (or a fee would swallow the first payout). | `create_stream`, `top_up`, `modify_rate`, `set_min_deposit` |
+| 5 | `NothingToWithdraw` | The stream accrued nothing since its last checkpoint. | `withdraw` |
+| 6 | `ContractPaused` | The admin paused the vault; see [Pausing](#pausing). | `create_stream`, `withdraw`, `withdraw_batch`, `top_up`, `modify_rate`, `transfer_stream` |
+| 7 | `FeeTooHigh` | Fee above the 1,000 bps (10%) cap. | `set_fee_bps`, `set_token_fee_bps` |
+| 8 | `NoPendingAdmin` | No admin proposal is pending. | `accept_admin`, `cancel_admin_proposal` |
+| 9 | `ArithmeticOverflow` | Checked balance, total, counter, or grace-ledger arithmetic left `i128`/`u64` range. | `create_stream`, `withdraw`, `withdraw_batch`, `cancel_stream`, `top_up`, `modify_rate`, `transfer_stream`, `set_cancel_grace_ledgers` |
+| 10 | `SelfStream` | Donor and NGO are the same address. | `create_stream` |
+| 11 | `InvalidTreasury` | Treasury address is the vault itself. | `set_treasury` |
+| 12 | `AlreadyPaused` | `pause` called while already paused. | `pause` |
+| 13 | `AlreadyUnpaused` | `unpause` called while already active. | `unpause` |
+| 14 | `DepositTooLow` | Deposit is below the configured `min_deposit`. | `create_stream` |
+| 15 | `StreamCancelled` | The stream was already closed out by `cancel_stream`/`rescue_stream`. | `top_up`, `modify_rate`, `transfer_stream`, `rescue_stream` |
+| 16 | `InvalidAdmin` | The proposed admin equals the current admin. | `propose_admin` |
+| 17 | `StreamLimitExceeded` | Donor reached `max_streams_per_donor`. | `create_stream` |
+| 18 | `NgoNotVerified` | A configured registry has no verified entry for the NGO. | `create_stream` |
+| 19 | `StreamCounterMissing` | The stream-id counter is absent from instance storage. | `create_stream` |
+| 20 | `AdminRenounced` | Admin control was permanently renounced, or `init` ran after a renounce. | `init`, `admin`, `propose_admin`, `cancel_admin_proposal`, `pause`, `unpause`, `set_treasury`, `clear_treasury`, `set_fee_bps`, `set_token_fee_bps`, `clear_token_fee_bps`, `set_min_deposit`, `set_cancel_grace_ledgers`, `set_max_streams_per_donor`, `set_registry`, `renounce_admin`, `rescue_stream`, `upgrade` |
+| 21 | `FeeRequiresTreasury` | A non-zero fee was set with no treasury, or the treasury was cleared while a fee is set. | `set_fee_bps`, `set_token_fee_bps`, `clear_treasury` |
+| 22 | `NotPaused` | `rescue_stream` called while the vault is active. | `rescue_stream` |
+| 23 | `MixedNgo` | A batch withdrawal mixed streams belonging to different NGOs. | `withdraw_batch` |
 
 ### `ngo-registry`
 
-| Code | Error                | Meaning                                                          |
-| ---- | --------------------- | ------------------------------------------------------------------ |
-| 1    | `AlreadyInitialized`  | `init` was already called; the registry already has an admin.    |
-| 2    | `NotInitialized`      | `init` has not been called yet, so there is no admin to act as.  |
-| 3    | `AlreadyRegistered`   | `register` was called for an address that already has an entry. |
-| 4    | `NotRegistered`       | No registry entry exists for the given owner address.            |
-| 5    | `AlreadyVerified`     | `update_name` was called on an NGO that an admin has already approved and its name is locked, or `approve_ngo` was called on an NGO that's already verified. |
-| 6    | `NameTooLong`         | `register` was called with a name longer than 200 bytes.         |
-| 7    | `NotVerified`         | `revoke_ngo` was called on an NGO that isn't currently verified.  |
-| 8    | `InvalidName`         | `register` received an empty or whitespace-only NGO name.       |
+Codes 1–11 are the full `Error` enum. Admin-gated entry points first call
+`require_admin`, so they can also return `NotInitialized`.
+
+| Code | Error | Meaning | Entry points |
+| --- | --- | --- | --- |
+| 1 | `AlreadyInitialized` | `init` already created an admin. | `init` |
+| 2 | `NotInitialized` | No admin is stored. | `admin`, `propose_admin`, `cancel_admin_proposal`, `approve_ngo`, `revoke_ngo`, `upgrade` |
+| 3 | `AlreadyRegistered` | The owner already has a registry entry. | `register` |
+| 4 | `NotRegistered` | No entry exists for the owner. | `unregister`, `update_name`, `get_ngo`, `approve_ngo`, `revoke_ngo`, `touch_ngo` |
+| 5 | `AlreadyVerified` | The action is not allowed once an NGO is verified: unregister, rename, or approve again. | `unregister`, `update_name`, `approve_ngo` |
+| 6 | `NameTooLong` | Name exceeds 200 bytes. | `register`, `update_name` |
+| 7 | `NotVerified` | `revoke_ngo` called on an NGO that is not verified. | `revoke_ngo` |
+| 8 | `NoPendingAdmin` | No admin proposal is pending. | `accept_admin`, `cancel_admin_proposal` |
+| 9 | `InvalidAdmin` | The proposed admin equals the current admin. | `propose_admin` |
+| 10 | `ArithmeticOverflow` | The owner index or total count left `u32`/`u64` range. | `register` |
+| 11 | `InvalidName` | The name is empty or whitespace-only. | `register` |
 
 ## Status
 
